@@ -1,0 +1,975 @@
+"""
+Chess Game — Python Edition
+Libraries: Tkinter (GUI), NumPy (board), Pandas (move history),
+           Matplotlib (stats), MongoDB/pymongo (save/load games)
+
+Install deps:
+    pip install numpy pandas matplotlib pymongo
+
+Run:
+    python chess_game.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from datetime import datetime
+
+# ── optional MongoDB (gracefully degraded if not running) ─────────────────────
+try:
+    from pymongo import MongoClient
+    _MONGO_AVAILABLE = True
+except ImportError:
+    _MONGO_AVAILABLE = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PIECE CONSTANTS  (mirrors C enum)
+# ═══════════════════════════════════════════════════════════════════════════════
+EMPTY = 0
+W_PAWN, W_KNIGHT, W_BISHOP, W_ROOK, W_QUEEN, W_KING = 1, 2, 3, 4, 5, 6
+B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING = 7, 8, 9, 10, 11, 12
+
+UNICODE = {
+    W_KING: "♔", W_QUEEN: "♕", W_ROOK: "♖",
+    W_BISHOP: "♗", W_KNIGHT: "♘", W_PAWN: "♙",
+    B_KING: "♚", B_QUEEN: "♛", B_ROOK: "♜",
+    B_BISHOP: "♝", B_KNIGHT: "♞", B_PAWN: "♟",
+    EMPTY: " ",
+}
+
+PIECE_NAME = {
+    W_PAWN: "Pawn",   W_KNIGHT: "Knight", W_BISHOP: "Bishop",
+    W_ROOK: "Rook",   W_QUEEN:  "Queen",  W_KING:   "King",
+    B_PAWN: "Pawn",   B_KNIGHT: "Knight", B_BISHOP: "Bishop",
+    B_ROOK: "Rook",   B_QUEEN:  "Queen",  B_KING:   "King",
+}
+
+# colour helpers
+def is_white(p):  return 1 <= p <= 6
+def is_black(p):  return 7 <= p <= 12
+def in_bounds(r, c): return 0 <= r < 8 and 0 <= c < 8
+
+def alg_to_pos(text):
+    """'e2' → (row, col) or None"""
+    if not text or len(text) < 2: return None
+    f = text[0].lower()
+    if not ('a' <= f <= 'h'): return None
+    if not ('1' <= text[1] <= '8'): return None
+    col = ord(f) - ord('a')
+    row = 8 - int(text[1])
+    return (row, col) if in_bounds(row, col) else None
+
+def pos_to_alg(r, c):
+    return chr(ord('a') + c) + str(8 - r)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GAME STATE  (NumPy board + metadata)
+# ═══════════════════════════════════════════════════════════════════════════════
+class GameState:
+    """All mutable game data wrapped in one object (easy to deep-copy)."""
+
+    def __init__(self):
+        # NumPy 8×8 integer board — key data structure requirement
+        self.board = np.zeros((8, 8), dtype=np.int8)
+        self.is_white_turn      = True
+        self.white_castle_k     = True
+        self.white_castle_q     = True
+        self.black_castle_k     = True
+        self.black_castle_q     = True
+        self.en_passant         = None   # (row,col) or None
+        self.halfmove_clock     = 0
+        self.fullmove_number    = 1
+
+    def copy(self):
+        gs = GameState()
+        gs.board             = self.board.copy()     # NumPy copy
+        gs.is_white_turn     = self.is_white_turn
+        gs.white_castle_k    = self.white_castle_k
+        gs.white_castle_q    = self.white_castle_q
+        gs.black_castle_k    = self.black_castle_k
+        gs.black_castle_q    = self.black_castle_q
+        gs.en_passant        = self.en_passant
+        gs.halfmove_clock    = self.halfmove_clock
+        gs.fullmove_number   = self.fullmove_number
+        return gs
+
+
+class MoveRecord:
+    """Snapshot of everything needed to undo a move."""
+
+    __slots__ = (
+        "from_pos", "to_pos", "moved_piece", "captured_piece",
+        "prev_white_castle_k", "prev_white_castle_q",
+        "prev_black_castle_k", "prev_black_castle_q",
+        "prev_en_passant", "prev_halfmove", "prev_fullmove",
+        "promotion_piece",
+    )
+
+    def __init__(self):
+        self.from_pos = self.to_pos = None
+        self.moved_piece = self.captured_piece = EMPTY
+        self.prev_white_castle_k = self.prev_white_castle_q = True
+        self.prev_black_castle_k = self.prev_black_castle_q = True
+        self.prev_en_passant     = None
+        self.prev_halfmove       = 0
+        self.prev_fullmove       = 1
+        self.promotion_piece     = EMPTY
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CHESS ENGINE  (direct port of the C logic)
+# ═══════════════════════════════════════════════════════════════════════════════
+class ChessEngine:
+
+    INIT_BOARD = [
+        [B_ROOK, B_KNIGHT, B_BISHOP, B_QUEEN, B_KING, B_BISHOP, B_KNIGHT, B_ROOK],
+        [B_PAWN] * 8,
+        [EMPTY]  * 8, [EMPTY] * 8, [EMPTY] * 8, [EMPTY] * 8,
+        [W_PAWN] * 8,
+        [W_ROOK, W_KNIGHT, W_BISHOP, W_QUEEN, W_KING, W_BISHOP, W_KNIGHT, W_ROOK],
+    ]
+
+    def __init__(self):
+        self.state        = GameState()
+        self.move_history = []          # list[MoveRecord]
+        self._init_board()
+
+    # ── setup ────────────────────────────────────────────────────────────────
+    def _init_board(self):
+        for r, row in enumerate(self.INIT_BOARD):
+            for c, p in enumerate(row):
+                self.state.board[r, c] = p
+
+    def reset(self):
+        self.state        = GameState()
+        self.move_history = []
+        self._init_board()
+
+    # ── attack detection ─────────────────────────────────────────────────────
+    def square_attacked_by(self, state, tr, tc, by_white):
+        board = state.board
+
+        # Pawn attacks
+        if by_white:
+            for dc in (-1, 1):
+                r2, c2 = tr - 1, tc + dc
+                if in_bounds(r2, c2) and board[r2, c2] == W_PAWN:
+                    return True
+        else:
+            for dc in (-1, 1):
+                r2, c2 = tr + 1, tc + dc
+                if in_bounds(r2, c2) and board[r2, c2] == B_PAWN:
+                    return True
+
+        # Knights — NumPy: use vectorised check list
+        knight = W_KNIGHT if by_white else B_KNIGHT
+        for dr, dc in ((-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)):
+            r2, c2 = tr + dr, tc + dc
+            if in_bounds(r2, c2) and board[r2, c2] == knight:
+                return True
+
+        rook   = W_ROOK   if by_white else B_ROOK
+        queen  = W_QUEEN  if by_white else B_QUEEN
+        bishop = W_BISHOP if by_white else B_BISHOP
+        king   = W_KING   if by_white else B_KING
+
+        # Orthogonal (rook / queen / king-1-step)
+        for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+            r2, c2 = tr + dr, tc + dc
+            while in_bounds(r2, c2):
+                p = board[r2, c2]
+                if p != EMPTY:
+                    if p in (rook, queen): return True
+                    if p == king and r2 == tr+dr and c2 == tc+dc: return True
+                    break
+                r2 += dr; c2 += dc
+
+        # Diagonal (bishop / queen / king-1-step)
+        for dr, dc in ((-1,-1),(-1,1),(1,-1),(1,1)):
+            r2, c2 = tr + dr, tc + dc
+            while in_bounds(r2, c2):
+                p = board[r2, c2]
+                if p != EMPTY:
+                    if p in (bishop, queen): return True
+                    if p == king and r2 == tr+dr and c2 == tc+dc: return True
+                    break
+                r2 += dr; c2 += dc
+
+        return False
+
+    def find_king(self, state, white):
+        king = W_KING if white else B_KING
+        pos = np.argwhere(state.board == king)   # NumPy search
+        return tuple(pos[0]) if len(pos) else None
+
+    def is_in_check(self, state, white):
+        kp = self.find_king(state, white)
+        if kp is None: return False
+        return self.square_attacked_by(state, kp[0], kp[1], not white)
+
+    # ── pseudo-legal move check (mirrors C is_pseudo_legal_move) ─────────────
+    def is_pseudo_legal(self, state, from_pos, to_pos, promotion=None):
+        fr, fc = from_pos; tr, tc = to_pos
+        if not (in_bounds(fr, fc) and in_bounds(tr, tc)): return False
+        piece = int(state.board[fr, fc])
+        if piece == EMPTY: return False
+        moving_white = is_white(piece)
+        if state.is_white_turn != moving_white: return False
+        target = int(state.board[tr, tc])
+        if target != EMPTY and is_white(target) == moving_white: return False
+
+        dr, dc = tr - fr, tc - fc
+        adr, adc = abs(dr), abs(dc)
+
+        # ── Pawn ──────────────────────────────────────────────────────────────
+        if piece in (W_PAWN, B_PAWN):
+            direction = -1 if piece == W_PAWN else 1
+            if dc == 0:
+                if dr == direction:
+                    if state.board[tr, tc] != EMPTY: return False
+                    if piece == W_PAWN and tr == 0 and not promotion: return False
+                    if piece == B_PAWN and tr == 7 and not promotion: return False
+                    return True
+                # double push
+                if piece == W_PAWN and fr == 6 and dr == -2:
+                    return (state.board[fr-1, fc] == EMPTY and
+                            state.board[tr,  tc]  == EMPTY)
+                if piece == B_PAWN and fr == 1 and dr == 2:
+                    return (state.board[fr+1, fc] == EMPTY and
+                            state.board[tr,  tc]  == EMPTY)
+                return False
+            if adc == 1 and dr == direction:
+                if state.board[tr, tc] != EMPTY: return True
+                ep = state.en_passant
+                if ep and (tr, tc) == ep: return True
+                return False
+            return False
+
+        # ── Knight ────────────────────────────────────────────────────────────
+        if piece in (W_KNIGHT, B_KNIGHT):
+            return (adr == 2 and adc == 1) or (adr == 1 and adc == 2)
+
+        # ── King ──────────────────────────────────────────────────────────────
+        if piece in (W_KING, B_KING):
+            if adr <= 1 and adc <= 1: return True
+            if dr == 0 and adc == 2:
+                if piece == W_KING and fr == 7 and fc == 4:
+                    if dc == 2:  return (state.white_castle_k and
+                                         state.board[7,5]==EMPTY and state.board[7,6]==EMPTY and
+                                         state.board[7,7]==W_ROOK)
+                    if dc == -2: return (state.white_castle_q and
+                                         state.board[7,3]==EMPTY and state.board[7,2]==EMPTY and
+                                         state.board[7,1]==EMPTY and state.board[7,0]==W_ROOK)
+                if piece == B_KING and fr == 0 and fc == 4:
+                    if dc == 2:  return (state.black_castle_k and
+                                         state.board[0,5]==EMPTY and state.board[0,6]==EMPTY and
+                                         state.board[0,7]==B_ROOK)
+                    if dc == -2: return (state.black_castle_q and
+                                         state.board[0,3]==EMPTY and state.board[0,2]==EMPTY and
+                                         state.board[0,1]==EMPTY and state.board[0,0]==B_ROOK)
+            return False
+
+        # ── Sliding (Rook / Bishop / Queen) ───────────────────────────────────
+        if piece in (W_ROOK,B_ROOK,W_BISHOP,B_BISHOP,W_QUEEN,B_QUEEN):
+            if dr == 0 and dc == 0: return False
+            rook_like   = piece in (W_ROOK,B_ROOK,W_QUEEN,B_QUEEN)  and (dr==0 or dc==0)
+            bishop_like = piece in (W_BISHOP,B_BISHOP,W_QUEEN,B_QUEEN) and adr==adc
+            if not rook_like and not bishop_like: return False
+            sr = 0 if dr==0 else (1 if dr>0 else -1)
+            sc = 0 if dc==0 else (1 if dc>0 else -1)
+            r2, c2 = fr+sr, fc+sc
+            while (r2, c2) != (tr, tc):
+                if not in_bounds(r2, c2) or state.board[r2, c2] != EMPTY: return False
+                r2 += sr; c2 += sc
+            return True
+
+        return False
+
+    # ── perform move (mutates state) ─────────────────────────────────────────
+    def _perform_move(self, state, from_pos, to_pos, promotion=None):
+        rec = MoveRecord()
+        fr, fc = from_pos; tr, tc = to_pos
+        rec.from_pos  = from_pos;  rec.to_pos  = to_pos
+        rec.moved_piece   = int(state.board[fr, fc])
+        rec.captured_piece= int(state.board[tr, tc])
+        rec.prev_white_castle_k = state.white_castle_k
+        rec.prev_white_castle_q = state.white_castle_q
+        rec.prev_black_castle_k = state.black_castle_k
+        rec.prev_black_castle_q = state.black_castle_q
+        rec.prev_en_passant  = state.en_passant
+        rec.prev_halfmove    = state.halfmove_clock
+        rec.prev_fullmove    = state.fullmove_number
+
+        piece = rec.moved_piece
+
+        # halfmove clock
+        if piece in (W_PAWN, B_PAWN) or state.board[tr, tc] != EMPTY:
+            state.halfmove_clock = 0
+        else:
+            state.halfmove_clock += 1
+
+        # en-passant capture
+        if (piece in (W_PAWN, B_PAWN) and state.en_passant and
+                (tr, tc) == state.en_passant and state.board[tr, tc] == EMPTY):
+            capr = tr + (1 if piece == W_PAWN else -1)
+            rec.captured_piece = int(state.board[capr, tc])
+            state.board[capr, tc] = EMPTY
+
+        state.en_passant = None
+        state.board[tr, tc] = state.board[fr, fc]
+        state.board[fr, fc] = EMPTY
+
+        # new en-passant target
+        if piece == W_PAWN and fr == 6 and tr == 4:
+            state.en_passant = (5, fc)
+        elif piece == B_PAWN and fr == 1 and tr == 3:
+            state.en_passant = (2, fc)
+
+        # castling rook move
+        if piece in (W_KING, B_KING) and fr == tr and abs(tc-fc) == 2:
+            if tc == 6:
+                state.board[tr, 5] = state.board[tr, 7]; state.board[tr, 7] = EMPTY
+            elif tc == 2:
+                state.board[tr, 3] = state.board[tr, 0]; state.board[tr, 0] = EMPTY
+
+        # promotion
+        if (piece == W_PAWN and tr == 0) or (piece == B_PAWN and tr == 7):
+            pmap = {'q': W_QUEEN if is_white(piece) else B_QUEEN,
+                    'r': W_ROOK  if is_white(piece) else B_ROOK,
+                    'b': W_BISHOP if is_white(piece) else B_BISHOP,
+                    'n': W_KNIGHT if is_white(piece) else B_KNIGHT}
+            prom = pmap.get(promotion, W_QUEEN if is_white(piece) else B_QUEEN)
+            state.board[tr, tc]   = prom
+            rec.promotion_piece   = prom
+
+        # castling rights
+        if piece == W_KING: state.white_castle_k = state.white_castle_q = False
+        if piece == B_KING: state.black_castle_k = state.black_castle_q = False
+        for (rr, cc), attr in (
+            ((7,0),'white_castle_q'),((7,7),'white_castle_k'),
+            ((0,0),'black_castle_q'),((0,7),'black_castle_k'),
+        ):
+            if (fr,fc)==(rr,cc) or (tr,tc)==(rr,cc):
+                setattr(state, attr, False)
+
+        if not state.is_white_turn: state.fullmove_number += 1
+        state.is_white_turn = not state.is_white_turn
+        return rec
+
+    # ── public API ───────────────────────────────────────────────────────────
+    def make_move_if_legal(self, from_pos, to_pos, promotion=None):
+        if not self.is_pseudo_legal(self.state, from_pos, to_pos, promotion):
+            return False
+        test = self.state.copy()
+        self._perform_move(test, from_pos, to_pos, promotion)
+        if self.is_in_check(test, is_white(int(self.state.board[from_pos]))):
+            return False
+        rec = self._perform_move(self.state, from_pos, to_pos, promotion)
+        self.move_history.append(rec)
+        return True
+
+    def undo_last_move(self):
+        if not self.move_history: return False
+        rec   = self.move_history.pop()
+        state = self.state
+        state.is_white_turn    = not state.is_white_turn
+        state.fullmove_number  = rec.prev_fullmove
+        state.halfmove_clock   = rec.prev_halfmove
+        fr, fc = rec.from_pos; tr, tc = rec.to_pos
+        state.board[fr, fc]    = rec.moved_piece
+        state.board[tr, tc]    = rec.captured_piece
+        if rec.moved_piece in (W_KING,B_KING) and fr==tr and abs(tc-fc)==2:
+            if tc==6: state.board[tr,7]=state.board[tr,5]; state.board[tr,5]=EMPTY
+            elif tc==2: state.board[tr,0]=state.board[tr,3]; state.board[tr,3]=EMPTY
+        if rec.promotion_piece != EMPTY:
+            state.board[fr, fc] = W_PAWN if is_white(rec.moved_piece) else B_PAWN
+        state.white_castle_k = rec.prev_white_castle_k
+        state.white_castle_q = rec.prev_white_castle_q
+        state.black_castle_k = rec.prev_black_castle_k
+        state.black_castle_q = rec.prev_black_castle_q
+        state.en_passant     = rec.prev_en_passant
+        return True
+
+    def get_legal_moves_for(self, from_pos):
+        fr, fc = from_pos
+        piece  = int(self.state.board[fr, fc])
+        if piece == EMPTY or is_white(piece) != self.state.is_white_turn: return []
+        moves = []
+        for tr in range(8):
+            for tc in range(8):
+                prom = None
+                if piece == W_PAWN and tr == 0: prom = 'q'
+                if piece == B_PAWN and tr == 7: prom = 'q'
+                if not self.is_pseudo_legal(self.state, (fr,fc), (tr,tc), prom): continue
+                test = self.state.copy()
+                self._perform_move(test, (fr,fc), (tr,tc), prom)
+                if not self.is_in_check(test, is_white(piece)):
+                    moves.append((tr, tc))
+        return moves
+
+    def side_has_legal_move(self, white):
+        saved = self.state.is_white_turn
+        self.state.is_white_turn = white
+        result = False
+        positions = np.argwhere(                          # NumPy: find all pieces
+            (self.state.board >= 1) & (self.state.board <= 6)
+            if white else
+            (self.state.board >= 7) & (self.state.board <= 12)
+        )
+        for fr, fc in positions:
+            piece = int(self.state.board[fr, fc])
+            for tr in range(8):
+                for tc in range(8):
+                    prom = None
+                    if piece == W_PAWN and tr==0: prom='q'
+                    if piece == B_PAWN and tr==7: prom='q'
+                    if not self.is_pseudo_legal(self.state,(fr,fc),(tr,tc),prom): continue
+                    test = self.state.copy()
+                    self._perform_move(test,(fr,fc),(tr,tc),prom)
+                    if not self.is_in_check(test, white):
+                        result = True; break
+                if result: break
+            if result: break
+        self.state.is_white_turn = saved
+        return result
+
+    def game_status(self):
+        white   = self.state.is_white_turn
+        in_chk  = self.is_in_check(self.state, white)
+        has_mv  = self.side_has_legal_move(white)
+        if in_chk and not has_mv: return 'checkmate'
+        if not in_chk and not has_mv: return 'stalemate'
+        if in_chk: return 'check'
+        return 'ongoing'
+
+    # ── Pandas: move history DataFrame ───────────────────────────────────────
+    def history_dataframe(self):
+        rows = []
+        for i, rec in enumerate(self.move_history):
+            rows.append({
+                "Move #":    i // 2 + 1,
+                "Side":      "White" if i % 2 == 0 else "Black",
+                "Move":      pos_to_alg(*rec.from_pos) + pos_to_alg(*rec.to_pos),
+                "Piece":     PIECE_NAME.get(rec.moved_piece, "?"),
+                "From":      pos_to_alg(*rec.from_pos),
+                "To":        pos_to_alg(*rec.to_pos),
+                "Captured":  PIECE_NAME.get(rec.captured_piece, "") if rec.captured_piece else "",
+                "Promotion": UNICODE.get(rec.promotion_piece, "") if rec.promotion_piece else "",
+            })
+        return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MongoDB DATABASE MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+class DatabaseManager:
+
+    def __init__(self, uri="mongodb://localhost:27017/", db_name="chess_db"):
+        self.connected = False
+        if not _MONGO_AVAILABLE:
+            return
+        try:
+            self.client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+            self.client.server_info()
+            self.col = self.client[db_name]["games"]
+            self.connected = True
+        except Exception as exc:
+            print(f"[MongoDB] not available: {exc}")
+
+    # ── CRUD ─────────────────────────────────────────────────────────────────
+    def save(self, engine, name=None):
+        if not self.connected: return False, "MongoDB not connected"
+        doc = {
+            "name":     name or f"Game_{datetime.now():%Y%m%d_%H%M%S}",
+            "saved_at": datetime.now(),
+            "moves": [
+                {"from": list(r.from_pos), "to": list(r.to_pos),
+                 "promotion": int(r.promotion_piece)}
+                for r in engine.move_history
+            ],
+            "total_moves": len(engine.move_history),
+        }
+        result = self.col.insert_one(doc)
+        return True, str(result.inserted_id)
+
+    def load(self, name):
+        if not self.connected: return None, "MongoDB not connected"
+        doc = self.col.find_one({"name": name})
+        return (doc, "OK") if doc else (None, f"'{name}' not found")
+
+    def list_games(self):
+        if not self.connected: return []
+        return list(self.col.find({}, {"name":1,"saved_at":1,"total_moves":1,"_id":0}))
+
+    def delete(self, name):
+        if not self.connected: return False, "MongoDB not connected"
+        res = self.col.delete_one({"name": name})
+        return (True, "Deleted") if res.deleted_count else (False, "Not found")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  THEME COLOURS
+# ═══════════════════════════════════════════════════════════════════════════════
+LIGHT_SQ   = "#f2e2c6"
+DARK_SQ    = "#b58863"
+SEL_COLOR  = "#f6f669"
+LEGAL_CLR  = "#aef25a"
+CHECK_CLR  = "#e84040"
+ACCENT     = "#8a5a3b"
+PAGE_BG    = "#ffffff"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TKINTER GUI
+# ═══════════════════════════════════════════════════════════════════════════════
+class ChessGUI:
+
+    SQ = 72  # square size px
+
+    def __init__(self, root):
+        self.root    = root
+        self.root.title("Chess — Python Edition")
+        self.root.configure(bg=PAGE_BG)
+
+        self.engine  = ChessEngine()
+        self.db      = DatabaseManager()
+
+        self.selected      = None
+        self.legal_targets = []
+        self.game_over     = False
+
+        self._build_ui()
+        self._refresh()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        # left guide
+        left = tk.Frame(self.root, bg=PAGE_BG, width=220)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(10,0), pady=10)
+        left.pack_propagate(False)
+        self._build_guide(left)
+
+        # centre board
+        centre = tk.Frame(self.root, bg=PAGE_BG)
+        centre.pack(side=tk.LEFT, padx=16, pady=10)
+
+        tk.Label(centre, text="♔  Chess Board",
+                 font=("Georgia",17,"bold"), fg=ACCENT, bg=PAGE_BG).pack(anchor="w", pady=(0,4))
+
+        bp = self.SQ * 8 + 36
+        self.canvas = tk.Canvas(centre, width=bp, height=bp+4,
+                                bg=PAGE_BG, highlightthickness=0)
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._on_click)
+
+        # right controls
+        right = tk.Frame(self.root, bg=PAGE_BG, width=300)
+        right.pack(side=tk.LEFT, fill=tk.Y, padx=(0,10), pady=10)
+        right.pack_propagate(False)
+        self._build_controls(right)
+
+    def _build_guide(self, parent):
+        tk.Label(parent, text="♟ Quick Guide",
+                 font=("Arial",11,"bold"), fg=ACCENT, bg=PAGE_BG).pack(anchor="w", pady=(6,4))
+        entries = [
+            ("Goal",       "Checkmate the opponent's king."),
+            ("King",       "One square, any direction."),
+            ("Queen",      "Any number, any direction."),
+            ("Rook",       "Straight lines only."),
+            ("Bishop",     "Diagonals only."),
+            ("Knight",     "L-shape; jumps over pieces."),
+            ("Pawn",       "Forward 1-2 (first); captures diagonally."),
+            ("Castling",   "King ↔ Rook swap (special conditions)."),
+            ("En Passant", "Pawn capture after 2-sq advance."),
+            ("Promotion",  "Pawn at far rank → upgrade."),
+            ("Check",      "King attacked — must escape."),
+            ("Checkmate",  "No escape → game over."),
+            ("Stalemate",  "No legal move, not in check → draw."),
+        ]
+        for title, desc in entries:
+            f = tk.Frame(parent, bg=PAGE_BG)
+            f.pack(anchor="w", fill="x", pady=1)
+            tk.Label(f, text=f"• {title}:", font=("Arial",8,"bold"),
+                     fg=ACCENT, bg=PAGE_BG).pack(anchor="w")
+            tk.Label(f, text=f"  {desc}", font=("Arial",8), fg="#555",
+                     bg=PAGE_BG, wraplength=210, justify="left").pack(anchor="w")
+
+    def _build_controls(self, parent):
+        tk.Label(parent, text="Chess Board", font=("Arial",15,"bold"),
+                 fg=ACCENT, bg=PAGE_BG).pack(pady=(6,2))
+
+        self.status_var = tk.StringVar(value="Initialising…")
+        tk.Label(parent, textvariable=self.status_var, font=("Arial",10),
+                 fg="#666", bg=PAGE_BG, wraplength=280).pack(pady=(0,6))
+
+        # move input row
+        row = tk.Frame(parent, bg=PAGE_BG)
+        row.pack(fill="x", padx=4, pady=4)
+        self.move_entry = tk.Entry(row, font=("Consolas",12), width=12,
+                                   relief="solid", bd=1)
+        self.move_entry.pack(side=tk.LEFT, padx=(0,6))
+        self.move_entry.bind("<Return>", lambda _: self._play_text_move())
+        tk.Button(row, text="Play", font=("Arial",10,"bold"),
+                  bg=ACCENT, fg="white", relief="flat", padx=10,
+                  command=self._play_text_move).pack(side=tk.LEFT)
+
+        # action buttons
+        bf = tk.Frame(parent, bg=PAGE_BG)
+        bf.pack(fill="x", padx=4, pady=4)
+        for label, cmd in (("Undo",self._undo),("Reset",self._reset),
+                            ("Stats",self._show_stats),("Database",self._show_db)):
+            tk.Button(bf, text=label, font=("Arial",9), bg="#f5ece4", fg=ACCENT,
+                      relief="flat", padx=7, pady=4, command=cmd).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(parent, text="Move History (Pandas)",
+                 font=("Arial",10,"bold"), fg=ACCENT, bg=PAGE_BG).pack(pady=(10,2), anchor="w")
+
+        mf = tk.Frame(parent, bg=PAGE_BG)
+        mf.pack(fill=tk.BOTH, expand=True, padx=4)
+        self.move_text = tk.Text(mf, font=("Consolas",9), bg="#fffaf6",
+                                 fg="#333", width=26, relief="solid", bd=1,
+                                 state="disabled", wrap="word")
+        sb = tk.Scrollbar(mf, command=self.move_text.yview)
+        self.move_text.configure(yscrollcommand=sb.set)
+        self.move_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.move_text.tag_configure("wm", foreground="#7a4f32", font=("Consolas",9,"bold"))
+        self.move_text.tag_configure("bm", foreground="#333",    font=("Consolas",9))
+        self.move_text.tag_configure("nn", foreground="#aaa",    font=("Consolas",9))
+
+        tk.Label(parent, text="Click piece → see legal moves. Type e2e4 or e2 e4.",
+                 font=("Arial",8), fg="#aaa", bg=PAGE_BG, wraplength=280).pack(pady=4)
+
+    # ── board rendering ───────────────────────────────────────────────────────
+    def _refresh(self):
+        self._draw_board()
+        self._update_status()
+        self._update_move_list()
+
+    def _draw_board(self):
+        c   = self.canvas
+        off = 18           # margin for rank/file labels
+        sq  = self.SQ
+        state = self.engine.state
+        c.delete("all")
+
+        # king-in-check square
+        check_sq = None
+        if self.engine.is_in_check(state, state.is_white_turn):
+            kp = self.engine.find_king(state, state.is_white_turn)
+            if kp: check_sq = kp
+
+        for r in range(8):
+            for col in range(8):
+                x0, y0 = off + col*sq, off + r*sq
+                x1, y1 = x0+sq, y0+sq
+
+                fill = LIGHT_SQ if (r+col)%2==0 else DARK_SQ
+                if   (r,col) == self.selected:        fill = SEL_COLOR
+                elif (r,col) in self.legal_targets:   fill = LEGAL_CLR
+                elif check_sq and (r,col)==check_sq:  fill = CHECK_CLR
+
+                c.create_rectangle(x0,y0,x1,y1, fill=fill, outline="")
+
+                p = int(state.board[r, col])
+                if p != EMPTY:
+                    sym  = UNICODE[p]
+                    clr  = "#ffffff" if is_white(p) else "#111"
+                    cx, cy = x0+sq//2, y0+sq//2
+                    # drop shadow (Tkinter does not support alpha hex; use square bg darkened)
+                    shadow_clr = "#555555" if (r+col)%2==0 else "#6b4c30"
+                    c.create_text(cx+1,cy+2, text=sym, font=("Segoe UI Emoji",28),
+                                  fill=shadow_clr, anchor="center")
+                    c.create_text(cx, cy,   text=sym, font=("Segoe UI Emoji",28),
+                                  fill=clr,          anchor="center")
+
+        # labels
+        for r in range(8):
+            c.create_text(8, off+r*sq+sq//2, text=str(8-r),
+                          font=("Arial",9), fill="#888", anchor="center")
+        for col in range(8):
+            c.create_text(off+col*sq+sq//2, off+8*sq+9,
+                          text=chr(ord('a')+col),
+                          font=("Arial",9), fill="#888", anchor="center")
+
+    # ── click handler ─────────────────────────────────────────────────────────
+    def _on_click(self, event):
+        if self.game_over: return
+        off = 18
+        col = (event.x - off) // self.SQ
+        row = (event.y - off) // self.SQ
+        if not in_bounds(row, col): return
+
+        if self.selected:
+            if (row, col) in self.legal_targets:
+                prom = None
+                piece = int(self.engine.state.board[self.selected])
+                if (piece==W_PAWN and row==0) or (piece==B_PAWN and row==7):
+                    prom = self._ask_promotion()
+                self.engine.make_move_if_legal(self.selected, (row,col), prom)
+                self.selected = None; self.legal_targets = []
+                self._refresh(); self._check_end()
+            else:
+                p = int(self.engine.state.board[row, col])
+                if p!=EMPTY and is_white(p)==self.engine.state.is_white_turn:
+                    self._select(row, col)
+                else:
+                    self.selected=None; self.legal_targets=[]; self._draw_board()
+        else:
+            p = int(self.engine.state.board[row, col])
+            if p==EMPTY or is_white(p)!=self.engine.state.is_white_turn: return
+            self._select(row, col)
+
+    def _select(self, r, c):
+        self.selected      = (r, c)
+        self.legal_targets = self.engine.get_legal_moves_for((r,c))
+        self._draw_board()
+
+    def _ask_promotion(self):
+        win = tk.Toplevel(self.root); win.title("Promote Pawn")
+        win.configure(bg=PAGE_BG); win.grab_set()
+        val = tk.StringVar(value="q")
+        tk.Label(win, text="Choose promotion:", font=("Arial",11,"bold"),
+                 fg=ACCENT, bg=PAGE_BG).pack(pady=10)
+        for name, v in (("Queen","q"),("Rook","r"),("Bishop","b"),("Knight","n")):
+            tk.Radiobutton(win, text=name, variable=val, value=v,
+                           font=("Arial",11), bg=PAGE_BG).pack(anchor="w", padx=20)
+        tk.Button(win, text="OK", command=win.destroy,
+                  bg=ACCENT, fg="white", font=("Arial",10,"bold"),
+                  relief="flat", padx=12).pack(pady=10)
+        win.wait_window()
+        return val.get()
+
+    def _play_text_move(self):
+        if self.game_over: return
+        raw = self.move_entry.get().strip().replace(" ","")
+        if len(raw) < 4:
+            self.status_var.set("Type e2e4 or e2e4q"); return
+        fp = alg_to_pos(raw[:2]); tp = alg_to_pos(raw[2:4])
+        if not fp or not tp:
+            self.status_var.set("Invalid squares."); return
+        prom = raw[4].lower() if len(raw)>=5 else None
+        if self.engine.make_move_if_legal(fp, tp, prom):
+            self.move_entry.delete(0, tk.END)
+            self.selected=None; self.legal_targets=[]
+            self._refresh(); self._check_end()
+        else:
+            self.status_var.set("Illegal move.")
+
+    def _undo(self):
+        if self.engine.undo_last_move():
+            self.selected=None; self.legal_targets=[]; self.game_over=False
+            self._refresh()
+        else:
+            self.status_var.set("Nothing to undo.")
+
+    def _reset(self):
+        self.engine.reset()
+        self.selected=None; self.legal_targets=[]; self.game_over=False
+        self._refresh()
+
+    def _check_end(self):
+        st = self.engine.game_status()
+        if st in ("checkmate","stalemate"):
+            self.game_over = True
+
+    # ── status & move list ────────────────────────────────────────────────────
+    def _update_status(self):
+        s = self.engine.state
+        side = "White" if s.is_white_turn else "Black"
+        gst  = self.engine.game_status()
+        msgs = {
+            "check":     f"⚠ {side} is in CHECK — Move {s.fullmove_number}",
+            "checkmate": f"♛ CHECKMATE — {'Black' if s.is_white_turn else 'White'} wins!",
+            "stalemate": "🤝 STALEMATE — Draw!",
+            "ongoing":   f"{side} to move — Move {s.fullmove_number}",
+        }
+        self.status_var.set(msgs.get(gst, ""))
+
+    def _update_move_list(self):
+        """Uses Pandas DataFrame to format & display the move history."""
+        df = self.engine.history_dataframe()
+        mt = self.move_text
+        mt.configure(state="normal"); mt.delete("1.0", tk.END)
+        if df.empty:
+            mt.insert(tk.END, "No moves yet.")
+        else:
+            for num in df["Move #"].unique():
+                sub = df[df["Move #"]==num]
+                mt.insert(tk.END, f"{num}. ", "nn")
+                for _, row in sub.iterrows():
+                    tag  = "wm" if row["Side"]=="White" else "bm"
+                    text = row["Move"] + ("x" if row["Captured"] else "") + "  "
+                    mt.insert(tk.END, text, tag)
+                mt.insert(tk.END, "\n")
+        mt.see(tk.END); mt.configure(state="disabled")
+
+    # ── statistics window (Matplotlib + Pandas) ───────────────────────────────
+    def _show_stats(self):
+        df = self.engine.history_dataframe()
+        if df.empty:
+            messagebox.showinfo("Stats","No moves played yet."); return
+
+        win = tk.Toplevel(self.root)
+        win.title("Game Statistics"); win.configure(bg=PAGE_BG)
+        win.geometry("860x640")
+
+        fig, axes = plt.subplots(2, 2, figsize=(11,7.5))
+        fig.patch.set_facecolor(PAGE_BG)
+        fig.suptitle("Game Statistics (Pandas + Matplotlib)",
+                     fontsize=13, fontweight="bold", color=ACCENT)
+
+        # ① Piece usage bar chart
+        ax = axes[0,0]
+        pc = df["Piece"].value_counts()
+        pc.plot(kind="bar", ax=ax, color=ACCENT, edgecolor="white", width=0.6)
+        ax.set_title("Pieces Moved", color=ACCENT, fontweight="bold"); ax.set_ylabel("Moves")
+        ax.tick_params(axis="x", rotation=30)
+
+        # ② Captures pie chart
+        ax = axes[0,1]
+        cap = df[df["Captured"]!=""].groupby("Side").size()
+        if not cap.empty:
+            cap.plot(kind="pie", ax=ax, colors=[LIGHT_SQ, DARK_SQ],
+                     autopct="%1.0f%%", startangle=140,
+                     textprops={"fontsize":10, "color":"#333"})
+            ax.set_title("Captures by Side", color=ACCENT, fontweight="bold"); ax.set_ylabel("")
+        else:
+            ax.text(0.5,0.5,"No captures yet",ha="center",va="center")
+            ax.set_title("Captures by Side", color=ACCENT, fontweight="bold")
+
+        # ③ White vs Black stacked bar — NumPy for array maths
+        ax = axes[1,0]
+        pieces = df["Piece"].unique()
+        w_ct = np.array([((df["Piece"]==p)&(df["Side"]=="White")).sum() for p in pieces])
+        b_ct = np.array([((df["Piece"]==p)&(df["Side"]=="Black")).sum() for p in pieces])
+        x    = np.arange(len(pieces))
+        ax.bar(x, w_ct, label="White", color=LIGHT_SQ, edgecolor=ACCENT)
+        ax.bar(x, b_ct, bottom=w_ct, label="Black", color=DARK_SQ, edgecolor=ACCENT)
+        ax.set_xticks(x); ax.set_xticklabels(pieces, rotation=30)
+        ax.set_title("Moves by Piece & Side", color=ACCENT, fontweight="bold")
+        ax.legend(fontsize=8)
+
+        # ④ Cumulative moves (line chart via NumPy cumsum)
+        ax = axes[1,1]
+        wdf = df[df["Side"]=="White"].reset_index(drop=True)
+        bdf = df[df["Side"]=="Black"].reset_index(drop=True)
+        ax.plot(np.arange(1,len(wdf)+1), np.arange(1,len(wdf)+1),
+                label="White", color=ACCENT, marker="o", markersize=3)
+        ax.plot(np.arange(1,len(bdf)+1), np.arange(1,len(bdf)+1),
+                label="Black", color=DARK_SQ, marker="s", markersize=3)
+        ax.set_title("Moves Over Time", color=ACCENT, fontweight="bold")
+        ax.set_xlabel("Half-move index"); ax.legend(fontsize=8)
+
+        plt.tight_layout()
+        FigureCanvasTkAgg(fig, master=win).get_tk_widget().pack(
+            fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Pandas DataFrame table
+        tk.Label(win, text="Raw Move Data (Pandas DataFrame)",
+                 font=("Arial",9,"bold"), fg=ACCENT, bg=PAGE_BG).pack(anchor="w", padx=12)
+        fr = tk.Frame(win); fr.pack(fill="x", padx=12, pady=(0,8))
+        cols = list(df.columns)
+        tv = ttk.Treeview(fr, columns=cols, show="headings", height=5)
+        for col in cols:
+            tv.heading(col, text=col); tv.column(col, width=80, anchor="center")
+        for _, row in df.iterrows():
+            tv.insert("","end", values=list(row))
+        tv.pack(fill="x")
+
+    # ── database dialog ───────────────────────────────────────────────────────
+    def _show_db(self):
+        win = tk.Toplevel(self.root)
+        win.title("Database — MongoDB CRUD"); win.configure(bg=PAGE_BG)
+        win.geometry("520x500")
+
+        conn_txt = "✔ Connected to MongoDB" if self.db.connected else "✘ MongoDB offline (install + start mongod)"
+        tk.Label(win, text=conn_txt, font=("Arial",10,"bold"),
+                 fg="green" if self.db.connected else "red", bg=PAGE_BG).pack(pady=8)
+
+        # Save section
+        sf = tk.LabelFrame(win, text="Save Current Game", font=("Arial",9,"bold"),
+                           fg=ACCENT, bg=PAGE_BG, padx=8, pady=6)
+        sf.pack(fill="x", padx=12, pady=4)
+        name_v = tk.StringVar(value=f"Game_{datetime.now():%Y%m%d_%H%M%S}")
+        tk.Entry(sf, textvariable=name_v, font=("Consolas",10), width=26).pack(side=tk.LEFT, padx=4)
+
+        tree_ref = []   # forward ref
+
+        def do_save():
+            ok, msg = self.db.save(self.engine, name_v.get())
+            messagebox.showinfo("Save", msg if ok else f"Error: {msg}")
+            if tree_ref: _refresh_tree(tree_ref[0])
+
+        tk.Button(sf, text="Save (INSERT)", bg=ACCENT, fg="white",
+                  font=("Arial",9,"bold"), relief="flat", padx=8,
+                  command=do_save).pack(side=tk.LEFT, padx=4)
+
+        # Game list (READ)
+        tk.Label(win, text="Saved Games (MongoDB READ)",
+                 font=("Arial",10,"bold"), fg=ACCENT, bg=PAGE_BG).pack(pady=(8,2))
+        lf = tk.Frame(win); lf.pack(fill=tk.BOTH, expand=True, padx=12)
+        cols = ["Name","Saved At","Moves"]
+        tv = ttk.Treeview(lf, columns=cols, show="headings", height=9)
+        for c in cols:
+            tv.heading(c,text=c); tv.column(c,width=140,anchor="center")
+        tv.pack(fill=tk.BOTH, expand=True)
+        tree_ref.append(tv)
+
+        def _refresh_tree(t):
+            for row in t.get_children(): t.delete(row)
+            for g in self.db.list_games():
+                t.insert("","end", values=[
+                    g.get("name",""), str(g.get("saved_at",""))[:19],
+                    g.get("total_moves",0)])
+
+        _refresh_tree(tv)
+
+        bf = tk.Frame(win, bg=PAGE_BG); bf.pack(pady=6)
+
+        def do_load():
+            sel = tv.selection()
+            if not sel: messagebox.showwarning("Load","Select a game first."); return
+            name = tv.item(sel[0])["values"][0]
+            doc, msg = self.db.load(name)
+            if not doc: messagebox.showerror("Load", msg); return
+            self.engine.reset()
+            for m in doc["moves"]:
+                fr=(m["from"][0],m["from"][1]); to=(m["to"][0],m["to"][1])
+                pp = m.get("promotion",0)
+                pmap={W_QUEEN:"q",W_ROOK:"r",W_BISHOP:"b",W_KNIGHT:"n",
+                      B_QUEEN:"q",B_ROOK:"r",B_BISHOP:"b",B_KNIGHT:"n"}
+                self.engine.make_move_if_legal(fr, to, pmap.get(pp))
+            self.selected=None; self.legal_targets=[]; self.game_over=False
+            self._refresh(); win.destroy()
+            messagebox.showinfo("Load",f"Loaded '{name}'")
+
+        def do_delete():
+            sel = tv.selection()
+            if not sel: return
+            name = tv.item(sel[0])["values"][0]
+            ok, msg = self.db.delete(name)
+            messagebox.showinfo("Delete", msg); _refresh_tree(tv)
+
+        for label, cmd, colour in (
+            ("Load (READ)",    do_load,   ACCENT),
+            ("Delete (DELETE)", do_delete, "#c0392b"),
+            ("Refresh",        lambda: _refresh_tree(tv), "#f5ece4"),
+        ):
+            fg = "white" if colour != "#f5ece4" else ACCENT
+            tk.Button(bf, text=label, bg=colour, fg=fg, font=("Arial",9,"bold"),
+                      relief="flat", padx=8, command=cmd).pack(side=tk.LEFT, padx=5)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.resizable(True, True)
+    ChessGUI(root)
+    root.mainloop()
